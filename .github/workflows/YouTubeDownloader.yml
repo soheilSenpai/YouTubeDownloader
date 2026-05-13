@@ -1,10 +1,20 @@
-name: 🎯 YouTubeDownloader
+name: 🎯 YouTube Downloader
 
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: '🔄 Download Mode'
+        required: true
+        type: choice
+        options:
+          - single
+          - playlist
+          - channel
+          - search
+        default: 'single'
       url:
-        description: '🎬 YouTube Video URL'
+        description: '🎬 URL or Search Query or channel name (@ChannelName or ChannelName)'
         required: true
         type: string
       type:
@@ -16,393 +26,457 @@ on:
           - audio
         default: 'video'
       quality:
-        description: '🎚️ Quality (video: 144p/360p/480p/720p/1080p | audio: 64kbps/128kbps/192kbps/320kbps)'
+        description: 'Quality (video: 144/360/480/720/1080 | audio: 128/192/320)'
         required: false
         type: string
-        default: '720p'
-      split_threshold_mb:
-        description: '📦 Split files larger than (MB) — 0 = never'
+        default: '720'
+      max_videos:
+        description: '🔢 Max results'
         required: false
         type: number
-        default: 90
+        default: 10
+      split_threshold_mb:
+        description: '📦 Split > MB (0=no)'
+        required: false
+        type: number
+        default: 50
+
+env:
+  PYTHONUNBUFFERED: '1'
+  DEBIAN_FRONTEND: 'noninteractive'
 
 jobs:
   download-and-process:
-    name: 🚀 Download & Process YouTube Content
+    name: 🚀 YouTube Downloader
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     permissions:
       contents: write
     
     steps:
-      - name: 📂 Clone Repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 1
 
-      - name: 🔧 Install Dependencies
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}
+
+      - name: ⚡ Setup
         run: |
-          sudo apt-get update
-          sudo apt-get install -y zip curl jq
+          python3 -c "import requests" 2>/dev/null || pip3 install -q requests
+          command -v yt-dlp &>/dev/null || pip3 install -q yt-dlp
+          command -v zip &>/dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq zip)
 
-      - name: 🎯 Request Conversion via API
-        id: converter
+      - name: 🔗 Prepare
+        id: prep
+        run: |
+          M="${{ github.event.inputs.mode }}"
+          U="${{ github.event.inputs.url }}"
+          [[ "$M" == "channel" && "$U" != http* ]] && U="https://www.youtube.com/$([[ "$U" == @* ]] && echo "$U" || echo "@$U")"
+          echo "URL=$U" >> $GITHUB_OUTPUT
+          echo "MODE=$M" >> $GITHUB_OUTPUT
+
+      - name: 🎯 Download & Process
+        id: main
+        env:
+          MODE: ${{ steps.prep.outputs.MODE }}
+          URL: ${{ steps.prep.outputs.URL }}
+          TYPE: ${{ github.event.inputs.type }}
+          QUALITY: ${{ github.event.inputs.quality }}
+          MAX: ${{ github.event.inputs.max_videos }}
+          SPLIT: ${{ github.event.inputs.split_threshold_mb }}
         run: |
           python3 << 'PYEOF'
-          import os, sys, json, time, re
-          import requests
-          
-          # ========== CONFIGURATION ==========
-          YT_URL = os.environ['YT_URL']
-          OUTPUT_TYPE = os.environ['OUTPUT_TYPE']
-          QUALITY = os.environ.get('QUALITY', '720p')
-          
-          API_ENDPOINT = "https://hub.ytconvert.org/api/download"
-          STATUS_CHECK_INTERVAL = 2
-          MAX_ATTEMPTS = 90
-          
-          # ========== SUPPORTED QUALITIES ==========
-          VIDEO_QUALITIES = ['144p', '360p', '480p', '720p', '1080p']
-          AUDIO_BITRATES = ['64kbps', '128kbps', '192kbps', '320kbps']
-          
-          def normalize_quality(output_type, quality_input):
-              """Normalize and validate input quality"""
-              
-              if output_type == 'audio':
-                  # Remove extra characters and normalize
-                  quality = quality_input.lower().strip()
-                  # If it has 'p' (entered by mistake), remove it
-                  quality = quality.replace('p', '')
-                  # If it doesn't have 'kbps', add it
-                  if 'kbps' not in quality:
-                      if quality.endswith('k'):
-                          quality = quality.replace('k', 'kbps')
-                      else:
-                          # If it's just a number
-                          quality = quality + 'kbps'
-                  
-                  # Check if valid
-                  if quality in AUDIO_BITRATES:
-                      return quality
-                  
-                  # Find the closest quality
-                  print(f"⚠️ Invalid audio quality: '{quality_input}'")
-                  bitrate_num = int(''.join(filter(str.isdigit, quality)))
-                  
-                  # Find closest bitrate
-                  supported_nums = [int(''.join(filter(str.isdigit, b))) for b in AUDIO_BITRATES]
-                  closest = min(supported_nums, key=lambda x: abs(x - bitrate_num))
-                  fallback = [b for b in AUDIO_BITRATES if str(closest) in b][0]
-                  
-                  print(f"🔄 Using closest supported bitrate: {fallback}")
-                  return fallback
-              
-              else:  # video
-                  quality = quality_input.lower().strip()
-                  # If it has 'k' (entered by mistake for video), remove it
-                  quality = quality.replace('k', '')
-                  # If it doesn't have 'p', add it
-                  if not quality.endswith('p'):
-                      quality += 'p'
-                  
-                  if quality in VIDEO_QUALITIES:
-                      return quality
-                  
-                  print(f"⚠️ Invalid video quality: '{quality_input}'")
-                  
-                  # Map invalid qualities to valid ones
-                  quality_map = {
-                      '240p': '360p',   # 240p is not supported, closest is 360p
-                      '4k': '1080p',    # 4K is not supported, closest is 1080p
-                      '2160p': '1080p',
-                      '1440p': '1080p',
-                      '2k': '1080p',
-                  }
-                  
-                  if quality in quality_map:
-                      fallback = quality_map[quality]
-                      print(f"🔄 Mapped to closest quality: {fallback}")
-                      return fallback
-                  
-                  # If none matched, default to 720p
-                  print("🔄 Using default: 720p")
-                  return '720p'
-          
-          # Apply normalization
-          QUALITY = normalize_quality(OUTPUT_TYPE, QUALITY)
-          
-          print(f"🎯 Target: {OUTPUT_TYPE.upper()} @ {QUALITY}")
-          print(f"{'='*50}")
-          
-          # ========== REQUEST HEADERS ==========
-          HEADERS = {
-              "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
-              "Accept": "application/json",
-              "Referer": "https://media.ytmp3.gg/",
-              "Content-Type": "application/json",
-              "Origin": "https://media.ytmp3.gg",
+          import os, json, time, re, subprocess, sys, hashlib
+          import requests as rq
+          from pathlib import Path
+          from datetime import datetime
+
+          M = os.environ['MODE']
+          U = os.environ['URL']
+          T = os.environ['TYPE']
+          Q = os.environ.get('QUALITY', '720')
+          MX = int(os.environ.get('MAX', '10'))
+          SP = int(os.environ.get('SPLIT', '50'))
+
+          API = 'https://hub.ytconvert.org/api/download'
+          H = {
+              'User-Agent': 'Mozilla/5.0',
+              'Accept': 'application/json',
+              'Referer': 'https://media.ytmp3.gg/',
+              'Content-Type': 'application/json',
+              'Origin': 'https://media.ytmp3.gg'
           }
-          
-          # ========== PREPARE PAYLOAD ==========
-          if OUTPUT_TYPE == 'audio':
-              payload = {
-                  "url": YT_URL,
-                  "os": "linux",
-                  "output": {
-                      "type": "audio",
-                      "format": "mp3"
-                  },
-                  "audio": {"bitrate": QUALITY}
-              }
-          else:
-              payload = {
-                  "url": YT_URL,
-                  "os": "linux",
-                  "output": {
-                      "type": "video",
-                      "format": "mp4",
-                      "quality": QUALITY
-                  }
-              }
-          
-          # ========== INITIATE CONVERSION ==========
-          print(f"📤 Requesting conversion for: {YT_URL}")
-          print(f"📋 Final payload: {json.dumps(payload, indent=2)}")
-          
-          session = requests.Session()
-          session.get("https://media.ytmp3.gg/", headers=HEADERS)
-          
-          try:
-              response = session.post(API_ENDPOINT, json=payload, headers=HEADERS, timeout=30)
-              
-              if response.status_code != 200:
-                  print(f"❌ API Error ({response.status_code}): {response.text[:200]}")
-                  
-                  # If it's 400, try once with different quality
-                  if response.status_code == 400 and OUTPUT_TYPE == 'audio':
-                      print("🔄 Retrying with fallback quality: 192kbps")
-                      payload["audio"]["bitrate"] = "192kbps"
-                      QUALITY = "192kbps"
-                      response = session.post(API_ENDPOINT, json=payload, headers=HEADERS, timeout=30)
-                  elif response.status_code == 400 and OUTPUT_TYPE == 'video':
-                      print("🔄 Retrying with fallback quality: 720p")
-                      payload["output"]["quality"] = "720p"
-                      QUALITY = "720p"
-                      response = session.post(API_ENDPOINT, json=payload, headers=HEADERS, timeout=30)
-                  
-                  response.raise_for_status()
-              
-              data = response.json()
-          
-          except requests.exceptions.RequestException as e:
-              print(f"❌ Request failed: {e}")
-              sys.exit(1)
-          
-          status_url = data.get('statusUrl')
-          title = data.get('title', 'youtube_video')
-          
-          if not status_url:
-              print(f"❌ API Error: No statusUrl in response")
-              print(f"Response: {json.dumps(data, indent=2)}")
-              sys.exit(1)
-          
-          print(f"✅ Conversion registered: {title}")
-          print(f"{'='*50}")
-          
-          # ========== POLL FOR COMPLETION ==========
-          download_url = None
-          for attempt in range(MAX_ATTEMPTS):
-              time.sleep(STATUS_CHECK_INTERVAL)
-              print(f"🔄 Checking status [{attempt + 1}/{MAX_ATTEMPTS}]...")
-              
+
+          def safe_name(text, maxlen=40):
+              safe = re.sub(r'[^\w]', '_', text)[:maxlen]
+              safe = re.sub(r'_+', '_', safe).strip('_')
+              if not safe:
+                  safe = hashlib.md5(text.encode()).hexdigest()[:8]
+              return safe
+
+          def fm(n):
+              if not n: return 'N/A'
               try:
-                  status_resp = session.get(status_url, headers=HEADERS, timeout=15)
-                  status_data = status_resp.json()
+                  n = int(n)
+                  return f'{n/1e6:.1f}M' if n >= 1e6 else f'{n/1e3:.1f}K' if n >= 1e3 else str(n)
+              except: return str(n)
+
+          def gv(vid):
+              """Get video info AND channel name from actual video data"""
+              try:
+                  r = subprocess.run(
+                      ['yt-dlp', '--dump-json', '--no-warnings', '--no-check-certificate',
+                       f'https://youtube.com/watch?v={vid}'],
+                      capture_output=True, text=True, timeout=15
+                  )
+                  if r.returncode == 0 and r.stdout.strip():
+                      d = json.loads(r.stdout)
+                      channel = (d.get('channel') or d.get('uploader') or 
+                                d.get('uploader_id') or d.get('creator') or 'Unknown')
+                      views = d.get('view_count')
+                      duration = d.get('duration', 0)
+                      channel_url = d.get('channel_url', '') or d.get('uploader_url', '')
+                      handle = None
+                      # Try to get @handle from channel_url
+                      if channel_url:
+                          m = re.search(r'@([\w-]+)', channel_url)
+                          if m: handle = m.group(1)
+                      # Fallback: use channel name as folder name
+                      if not handle:
+                          handle = safe_name(channel, 30) if channel and channel != 'Unknown' else None
+                      return (channel.strip() if channel else 'Unknown', views, int(duration) if duration else 0, handle)
+              except: pass
+              return ('Unknown', None, 0, None)
+
+          def get_channel_from_url(url):
+              """Extract channel identifier from any YouTube URL"""
+              # Try @handle
+              m = re.search(r'@([\w-]+)', url)
+              if m: return m.group(1)
+              # Try channel/ID
+              m = re.search(r'channel/([\w-]+)', url)
+              if m: return m.group(1)
+              # Try c/name
+              m = re.search(r'c/([\w-]+)', url)
+              if m: return m.group(1)
+              # Try /user/name
+              m = re.search(r'user/([\w-]+)', url)
+              if m: return m.group(1)
+              return None
+
+          def get_channel_from_playlist(playlist_url):
+              """Get the actual channel name from a playlist by looking at its first video"""
+              try:
+                  # Get first video from playlist
+                  cmd = ['yt-dlp', '--flat-playlist', '--dump-json', '--playlist-end', '1',
+                         '--no-warnings', '--no-check-certificate', playlist_url]
+                  r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+                  if r.returncode == 0 and r.stdout.strip():
+                      d = json.loads(r.stdout.strip().split('\n')[0])
+                      vid = d.get('id', '')
+                      if vid:
+                          _, _, _, handle = gv(vid)
+                          if handle: return handle
+                      # Fallback to uploader/channel from flat data
+                      ch = d.get('channel') or d.get('uploader') or d.get('uploader_id')
+                      if ch: return safe_name(ch, 30)
+              except: pass
+              return None
+
+          def gvl(u, n):
+              """Get video list - returns (videos, channel_folder_name)"""
+              # Step 1: Try to get channel from URL pattern
+              channel_folder = get_channel_from_url(u)
+              
+              # Step 2: If playlist and no channel found, get from first video
+              if not channel_folder and 'playlist' in u:
+                  print(f'   🔍 Detecting channel from playlist...')
+                  channel_folder = get_channel_from_playlist(u)
+              
+              # Step 3: Last resort
+              if not channel_folder:
+                  channel_folder = 'playlist_videos'
+              
+              print(f'   📁 Folder: {channel_folder}_videos')
+              
+              c = ['yt-dlp', '--flat-playlist', '--dump-json', '--no-warnings', '--no-check-certificate']
+              if n > 0: c.extend(['--playlist-end', str(n)])
+              c.append(u)
+              r = subprocess.run(c, capture_output=True, text=True, timeout=30)
+              v = []
+              for line in r.stdout.strip().split('\n'):
+                  if line and len(v) < n:
+                      try:
+                          d = json.loads(line)
+                          vid = d.get('id', '')
+                          if not vid: continue
+                          
+                          title = d.get('title', 'Untitled')[:60]
+                          print(f'   📊 [{len(v)+1}/{n}] {title}...')
+                          
+                          ch, vw, dr, _ = gv(vid)
+                          
+                          if not ch or ch == 'Unknown':
+                              ch = (d.get('channel') or d.get('uploader') or 
+                                    d.get('uploader_id') or d.get('creator') or 'Unknown')
+                          if not vw: vw = d.get('view_count')
+                          if not dr: dr = d.get('duration', 0)
+                          
+                          v.append({
+                              'id': vid, 't': title,
+                              'u': f'https://youtube.com/watch?v={vid}',
+                              'dr': int(dr) if dr else 0,
+                              'th': f'https://i.ytimg.com/vi/{vid}/maxresdefault.jpg',
+                              'c': str(ch).strip() if ch else 'Unknown',
+                              'v': fm(vw)
+                          })
+                      except Exception as e:
+                          print(f'      ⚠️ Skip: {str(e)[:40]}')
+                          continue
+              
+              return v, channel_folder
+
+          def mkidx(v, cn, cd):
+              ts = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+              Path('./playlists').mkdir(exist_ok=True)
+              inf = cd / 'info'
+              inf.mkdir(parents=True, exist_ok=True)
+              idxf = f'playlists/{cn}_{ts}.md'
+              
+              m = (f'# 📺 {cn}\n\n**{datetime.now():%Y-%m-%d %H:%M}** | **{len(v)} videos**\n\n'
+                   f'| # | Thumbnail | Title | Duration | Views |\n'
+                   f'|---|-----------|-------|----------|-------|\n')
+              for i, x in enumerate(v, 1):
+                  dur_str = f'{x["dr"]//60}:{x["dr"]%60:02d}' if x['dr'] else '?'
+                  m += f'| {i} | [<img src="{x["th"]}" width="80">]({x["u"]}) | [{x["t"]}]({x["u"]}) | {dur_str} | {x["v"]} |\n'
+              
+              m += '\n---\n\n## 📝 Details\n\n'
+              for i, x in enumerate(v, 1):
+                  sn = f'v{i:03d}_{x["id"]}'
+                  dur_str = f'{x["dr"]//60} minutes' if x['dr'] else 'Unknown'
+                  info_md = (f'# 🎬 {x["t"]}\n\n'
+                            f'![Thumbnail]({x["th"]})\n\n'
+                            f'## Info\n\n'
+                            f'| Property | Value |\n|----------|-------|\n'
+                            f'| **Channel** | {x["c"]} |\n'
+                            f'| **Duration** | {dur_str} |\n'
+                            f'| **Views** | {x["v"]} |\n'
+                            f'| **Video ID** | `{x["id"]}` |\n'
+                            f'| **URL** | {x["u"]} |\n\n'
+                            f'## Thumbnail\n\n'
+                            f'<img src="{x["th"]}" width="640">\n\n'
+                            f'---\n*Downloaded: {datetime.now():%Y-%m-%d %H:%M}*')
+                  (inf / f'{sn}.md').write_text(info_md)
+                  m += (f'### {i}. {x["t"]}\n\n'
+                       f'![Thumbnail]({x["th"]})\n\n'
+                       f'- **{dur_str}** | **{x["v"]}** views | **{x["c"]}**\n'
+                       f'- 📄 [info/{sn}.md](info/{sn}.md)\n\n---\n\n')
+              
+              Path(idxf).write_text(m)
+              print(f'📄 Index: {idxf}')
+              return idxf
+
+          def dl_video(u):
+              e = 'mp3' if T == 'audio' else 'mp4'
+              p = {'url': u, 'os': 'linux', 'output': {'type': 'audio' if T == 'audio' else 'video', 'format': e}}
+              if T == 'audio': p['audio'] = {'bitrate': f'{Q}k'}
+              else: p['output']['quality'] = f'{Q}p'
+
+              for retry in range(3):
+                  if retry > 0:
+                      print(f'   🔄 Retry {retry}/3...')
+                      time.sleep(5)
+                  try:
+                      rr = rq.post(API, json=p, headers=H, timeout=15)
+                      if rr.status_code != 200: continue
+                      d = rr.json()
+                      su = d.get('statusUrl')
+                      if not su: continue
+                      print(f'   ⏳ Converting...')
+                      for _ in range(60):
+                          time.sleep(2)
+                          try:
+                              sr = rq.get(su, headers=H, timeout=10)
+                              if sr.status_code == 200:
+                                  sd = sr.json()
+                                  st = sd.get('status', '')
+                                  if st == 'completed':
+                                      du = sd.get('downloadUrl')
+                                      if du: return {'u': du, 'e': e}
+                                  elif st in ('failed', 'error'): break
+                          except: continue
+                  except: time.sleep(2)
+              return None
+
+          def download_file(url, filepath):
+              try:
+                  dr = rq.get(url, headers=H, stream=True, timeout=600)
+                  if dr.status_code == 200:
+                      total = int(dr.headers.get('content-length', 0))
+                      done = 0
+                      with open(filepath, 'wb') as f:
+                          for chunk in dr.iter_content(65536):
+                              f.write(chunk)
+                              done += len(chunk)
+                              if total > 0 and done % (10*65536) == 0:
+                                  print(f'\r   ⬇️ {done*100/total:.1f}%', end='')
+                      print(f'\r   ⬇️ 100.0%')
+                      return filepath.stat().st_size
               except Exception as e:
-                  print(f"⚠️ Status check failed: {e}")
-                  continue
+                  print(f'   ❌ Download error: {e}')
+              return 0
+
+          def split_file(filepath, threshold_mb):
+              size_mb = filepath.stat().st_size / 1e6
+              if threshold_mb > 0 and size_mb > threshold_mb:
+                  print(f'   ✂️ Splitting ({size_mb:.0f}MB) into {threshold_mb}MB parts...')
+                  parent = filepath.parent
+                  name = filepath.name
+                  subprocess.run(['zip', '-r', '-q', '-s', f'{threshold_mb}m', f'{name}.zip', name], cwd=parent, check=True)
+                  filepath.unlink()
+                  parts = sorted(parent.glob(f'{name}.z*'))
+                  print(f'   ✅ Split into {len(parts)} parts')
+                  return True
+              return False
+
+          print(f'{"="*50}')
+          print(f'🎬 {M.upper()} MODE')
+          print(f'{"="*50}')
+
+          if M == 'search':
+              v, _ = gvl(f'ytsearch{MX}:{U}', MX)
+              if not v: print('❌ No results'); sys.exit(1)
+              ts = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+              Path('./searches').mkdir(exist_ok=True)
+              qs = safe_name(U, 30)
+              f = f'searches/{qs}_{ts}.md'
+              m = (f'# 🔍 Search: {U}\n\n**{datetime.now():%Y-%m-%d %H:%M}** | **{len(v)} results**\n\n'
+                   f'| # | Thumbnail | Title | Channel | Views | Duration |\n'
+                   f'|---|-----------|-------|---------|-------|----------|\n')
+              for i, x in enumerate(v, 1):
+                  m += f'| {i} | [<img src="{x["th"]}" width="80">]({x["u"]}) | [{x["t"]}]({x["u"]}) | {x["c"][:20]} | {x["v"]} | {x["dr"]//60}m |\n'
+              m += '\n---\n\n'
+              for i, x in enumerate(v, 1):
+                  m += (f'### {i}. {x["t"]}\n\n<img src="{x["th"]}" width="640">\n\n'
+                       f'| Property | Value |\n|----------|-------|\n'
+                       f'| Channel | {x["c"]} |\n| Duration | {x["dr"]//60}m |\n'
+                       f'| Views | {x["v"]} |\n| ID | `{x["id"]}` |\n| URL | {x["u"]} |\n\n---\n\n')
+              Path(f).write_text(m)
+              Path('/tmp/meta.json').write_text(json.dumps({'m': 'search', 'ok': 0}))
+              print(f'✅ {f}')
+
+          elif M in ('playlist', 'channel'):
+              print(f'\n📋 Extracting videos...')
+              v, cn = gvl(U, MX)
+              if not v: print('❌ No videos found'); sys.exit(1)
+
+              cd = Path(f'downloads/{cn}_videos')
+              cd.mkdir(parents=True, exist_ok=True)
+
+              print(f'\n📝 Creating index...')
+              mkidx(v, cn, cd)
+
+              ok, fl = [], []
+              print(f'\n📥 Downloading {len(v)} videos...\n{"="*50}')
               
-              status = status_data.get('status')
-              progress = status_data.get('progress', 0)
-              print(f"   Status: {status} | Progress: {progress}%")
-              
-              if status == 'completed':
-                  download_url = status_data.get('downloadUrl')
-                  if download_url:
-                      print("🎉 Conversion completed successfully!")
-                      break
-              elif status == 'failed':
-                  print("❌ Conversion failed!")
-                  print(f"   Error details: {status_data.get('error', 'Unknown error')}")
-                  sys.exit(1)
-          
-          if not download_url:
-              print("⏰ Timeout - conversion took too long")
-              sys.exit(1)
-          
-          # ========== GENERATE SAFE FILENAME ==========
-          # Extract video ID from URL
-          video_id_match = re.search(r'(?:v=|\/)([a-zA-Z0-9_-]{11})', YT_URL)
-          video_id = video_id_match.group(1) if video_id_match else "unknown"
-          
-          # Clean up the title
-          safe_title = re.sub(r'[^a-zA-Z0-9\-_]', '_', title.replace(' ', '_'))
-          # Limit filename length
-          safe_title = safe_title[:60] if len(safe_title) > 60 else safe_title
-          safe_title = safe_title.strip('_') or video_id
-          
-          # Determine extension and quality label
-          if OUTPUT_TYPE == 'audio':
-              extension = "mp3"
-              quality_label = QUALITY  # e.g. 320kbps
+              for i, x in enumerate(v, 1):
+                  print(f'\n📥 [{i}/{len(v)}] {x["t"]}')
+                  print(f'   Channel: {x["c"]} | Duration: {x["dr"]//60}m | Views: {x["v"]}')
+                  
+                  result = dl_video(x['u'])
+                  if result:
+                      fp = cd / f'v{i:03d}_{x["id"]}.{result["e"]}'
+                      size = download_file(result['u'], fp)
+                      if size:
+                          print(f'   ✅ Downloaded ({size/1e6:.1f}MB)')
+                          split_file(fp, SP)
+                          ok.append(x['t'])
+                      else:
+                          print(f'   ❌ Download failed')
+                          fl.append(x['t'])
+                  else:
+                      print(f'   ❌ Conversion failed')
+                      fl.append(x['t'])
+                  
+                  if i < len(v): 
+                      print(f'   ⏳ Waiting...')
+                      time.sleep(2)
+
+              Path('/tmp/meta.json').write_text(json.dumps({
+                  'm': M, 'cd': str(cd), 'ok': len(ok), 'fl': len(fl), 'total': len(v)
+              }))
+              print(f'\n{"="*50}')
+              print(f'📊 {len(ok)}/{len(v)} downloaded successfully')
+              if fl: print(f'❌ Failed: {fl}')
+              print(f'{"="*50}')
+
           else:
-              extension = "mp4"
-              quality_label = QUALITY  # e.g. 720p
+              # Single video mode
+              vid_match = re.search(r'(?:v=|/)([\w-]{11})', U)
+              vid = vid_match.group(1) if vid_match else 'x'
+              
+              # Get channel from the video itself
+              ch, _, _, handle = gv(vid)
+              cn = handle if handle else get_channel_from_url(U) or safe_name(ch, 30) or 'video'
+              
+              result = dl_video(U)
+              if result:
+                  cd = Path(f'downloads/{cn}_videos')
+                  cd.mkdir(parents=True, exist_ok=True)
+                  fp = cd / f'v_{vid}.{result["e"]}'
+                  size = download_file(result['u'], fp)
+                  if size:
+                      print(f'✅ Saved to {cn}_videos/ ({size/1e6:.1f}MB)')
+                      split_file(fp, SP)
+              else:
+                  print('❌ Failed'); sys.exit(1)
           
-          filename = f"{safe_title}_{video_id}_{quality_label}.{extension}"
-          
-          # ========== SAVE METADATA ==========
-          with open('/tmp/metadata.txt', 'w', encoding='utf-8') as f:
-              f.write(f"{download_url}\n")
-              f.write(f"{filename}\n")
-              f.write(f"{safe_title}\n")
-              f.write(f"{OUTPUT_TYPE}\n")
-              f.write(f"{QUALITY}\n")
-          
-          print(f"{'='*50}")
-          print(f"📥 Download URL: {download_url[:80]}...")
-          print(f"📄 Filename: {filename}")
-          print(f"🎵 Type: {OUTPUT_TYPE} | Quality: {QUALITY}")
-          print(f"{'='*50}")
           PYEOF
-        env:
-          YT_URL: ${{ github.event.inputs.url }}
-          OUTPUT_TYPE: ${{ github.event.inputs.type }}
-          QUALITY: ${{ github.event.inputs.quality }}
 
-      - name: ⬇️ Download Converted File
+      - name: 📤 Push Files
         run: |
-          DOWNLOAD_URL=$(sed -n '1p' /tmp/metadata.txt)
-          FILENAME=$(sed -n '2p' /tmp/metadata.txt)
-          OUTPUT_TYPE=$(sed -n '4p' /tmp/metadata.txt)
-          QUALITY=$(sed -n '5p' /tmp/metadata.txt)
-          
-          mkdir -p ./downloads/temp
-          
-          echo "⬇️ Downloading $OUTPUT_TYPE @ $QUALITY..."
-          echo "📄 File: $FILENAME"
-          
-          curl --progress-bar \
-            -L \
-            -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0" \
-            -H "Referer: https://media.ytmp3.gg/" \
-            -o "./downloads/temp/$FILENAME" \
-            --max-time 300 \
-            --retry 3 \
-            --retry-delay 5 \
-            "$DOWNLOAD_URL"
-          
-          if [ ! -f "./downloads/temp/$FILENAME" ]; then
-            echo "❌ Download failed!"
-            exit 1
-          fi
-          
-          FILE_SIZE=$(stat -c%s "./downloads/temp/$FILENAME")
-          FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
-          
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "✅ Downloaded: $FILENAME"
-          echo "📏 Size: ${FILE_SIZE_MB} MB"
-          echo "🎚️ Quality: $QUALITY"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
-      - name: ✂️ Smart Split Large Files
-        run: |
-          THRESHOLD_MB="${{ github.event.inputs.split_threshold_mb }}"
-          THRESHOLD_BYTES=$((THRESHOLD_MB * 1024 * 1024))
-          
-          process_file() {
-            local file="$1"
-            local size=$(stat -c%s "$file")
-            local basename=$(basename "$file")
-            local size_mb=$((size / 1024 / 1024))
-            
-            if [[ $THRESHOLD_BYTES -gt 0 && $size -gt $THRESHOLD_BYTES ]]; then
-              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-              echo "✂️ Splitting $basename (${size_mb}MB)"
-              echo "   Parts size: ${THRESHOLD_MB}MB each"
-              
-              cd ./downloads
-              zip -r -s "${THRESHOLD_MB}m" "${basename}.zip" "temp/${basename}"
-              cd ..
-              
-              PARTS_COUNT=$(ls ./downloads/${basename}.z* 2>/dev/null | wc -l)
-              echo "✅ Created $PARTS_COUNT parts"
-              
-              # Remove original file from temp
-              rm "$file"
-            else
-              if [[ $THRESHOLD_BYTES -eq 0 ]]; then
-                echo "📁 $basename (${size_mb}MB) — split disabled"
-              else
-                echo "📁 $basename (${size_mb}MB) — under threshold"
-              fi
-              mv "$file" "./downloads/"
-            fi
-          }
-          
-          export -f process_file
-          export THRESHOLD_BYTES THRESHOLD_MB
-          
-          find ./downloads/temp -type f -exec bash -c 'process_file "$0"' {} \;
-          rm -rf ./downloads/temp
-          
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "📂 Final files in ./downloads/:"
-          ls -lh ./downloads/ 2>/dev/null | tail -n +2 | awk '{print "  • " $NF " (" $5 ")"}'
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
-      - name: 📤 Commit and Push to Repository
-        run: |
-          BRANCH="${GITHUB_REF_NAME}"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📤 PUSHING TO GITHUB"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.email "bot@github.com"
           
-          # Stage all downloaded files
-          git add ./downloads/
+          echo ""
+          echo "📋 Adding all files..."
+          git add -A
           
-          if git diff --staged --quiet; then
-            echo "ℹ️ No changes to commit"
+          TOTAL=$(git diff --cached --name-only | wc -l)
+          echo "   Found $TOTAL files"
+          
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "❌ Nothing to push"
             exit 0
           fi
           
-          # Get list of staged files
-          mapfile -t STAGED_FILES < <(git diff --staged --name-only)
-          TOTAL_FILES=${#STAGED_FILES[@]}
-          
-          echo "📦 Found $TOTAL_FILES file(s) to upload"
-          
-          # Unstage everything first for batch processing
-          git reset HEAD ./downloads/
-          
-          BATCH_SIZE=5
-          for (( i=0; i<TOTAL_FILES; i+=BATCH_SIZE )); do
-            BATCH_NUM=$((i / BATCH_SIZE + 1))
-            END=$((i + BATCH_SIZE))
-            [[ $END -gt $TOTAL_FILES ]] && END=$TOTAL_FILES
-            
-            echo "🚀 Uploading batch $BATCH_NUM [$((i+1))–${END} of $TOTAL_FILES]"
-            
-            # Add files in current batch
-            for (( j=i; j<END; j++ )); do
-              git add "${STAGED_FILES[$j]}"
-            done
-            
-            git commit -m "chore: add YouTube content batch $BATCH_NUM [skip ci]"
-            git pull --rebase origin "$BRANCH" || true
-            git push origin "HEAD:$BRANCH"
-            
-            echo "✅ Batch $BATCH_NUM uploaded"
+          git diff --cached --name-only | while read f; do
+            echo "   📎 $f"
           done
           
-          echo "🎉 All files successfully uploaded to $BRANCH"
+          echo ""
+          echo "📤 Pushing..."
+          
+          git commit -m "📦 $(date +%m%d-%H%M) [skip ci]" --quiet
+          
+          for i in 1 2 3 4 5; do
+            echo -n "   🚀 Attempt $i/5..."
+            if git pull --rebase --quiet 2>/dev/null && git push --quiet 2>/dev/null; then
+              echo " ✅ DONE!"
+              exit 0
+            fi
+            echo " ❌"
+            git rebase --abort 2>/dev/null
+            [ $i -lt 5 ] && sleep $((i*5))
+          done
+          
+          echo "   ❌ Push failed"
+          exit 1
